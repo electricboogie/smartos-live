@@ -1,0 +1,426 @@
+#!/usr/bin/bash
+#
+#
+# This file and its contents are supplied under the terms of the
+# Common Development and Distribution License ("CDDL"), version 1.0.
+# You may only use this file in accordance with the terms of version
+# 1.0 of the CDDL.
+#
+# A full copy of the text of the CDDL should have accompanied this
+# source.  A copy of the CDDL is also available via the Internet at
+# http://www.illumos.org/license/CDDL.
+#
+
+#
+# Copyright 2016 Joyent, Inc.
+#
+shopt -s xpg_echo
+unalias -a
+
+PATH=/usr/bin:/usr/sbin:/sbin:/opt/local/bin:/opt/local/sbin
+export PATH
+
+conf_arg0=$(basename $0)
+conf_arg0_dir=$(dirname $0)
+conf_root=$PWD
+conf_ips=
+conf_priv="pfexec"
+conf_pkgsrcurl="https://download.joyent.com/pub/build/pkgsrc"
+
+function warn
+{
+	local msg="$*"
+	[[ -z "$msg" ]] && msg="failed"
+	echo "$conf_arg0: $msg" >&2
+}
+
+function fatal
+{
+	local msg="$*"
+	[[ -z "$msg" ]] && msg="failed"
+	echo "$conf_arg0: $msg" >&2
+	exit 1
+}
+
+function check_loc
+{
+	[[ "$(readlink -f "$PWD")" != "$(readlink -f "$conf_arg0_dir")" ]] && \
+	    fatal "configure must be run from inside $conf_arg0_dir"
+	[[ "$(uname -s)" != "SunOS" ]] && fatal "build only works on SunOS"
+	if [[ "$(uname -v)" =~ "joyent_" ]]; then
+		[[ "$(zonename)" == "global" ]] && fatal \
+		    "building in a GZ on SmartOS is not supported"
+	else	
+		echo "Not on SmartOS, assuming IPS and sudo"
+		conf_ips=1
+		conf_priv="sudo"
+	fi
+}
+
+function create_projects
+{
+	local dir="projects"
+	[[ -d "$dir" ]] || mkdir -p "$dir" || fatal "failed to create $dir"
+}
+
+function source_vars
+{
+	for file in "$(ls configure.*)"; do
+		source "$file" || fatal "failed to source $file"
+	done
+}
+
+function install_pkgin
+{
+	local pkglist=
+
+	#
+	# Newer images have a pkgin repo with a 'build-essential' package
+	# that pulls in several of the packages we need.  This is useful since
+	# it allows us to not worry about things like gcc46 vs. gcc47 etc.
+	#
+	$conf_priv pkgin -f update || fatal "failed to update pkgsrc repository"
+	if pkgin av build-essential | grep ^build-essential >/dev/null; then
+		pkglist="build-essential"
+	else
+		pkglist="gmake binutils autoconf automake bison"
+		pkglist="$pkglist libtool-base gcc-compiler"
+	fi
+
+	pkglist="$pkglist flex libxslt openjdk7 nodejs"
+	pkglist="$pkglist p5-XML-Parser gettext python27 py27-expat"
+	pkglist="$pkglist coreutils gsed pkg_alternatives cdrtools"
+
+	for pkg in $pkglist; do
+		if ! pkg_info -qe $pkg; then
+			$conf_priv pkgin -y install $pkg || fatal \
+		    "failed to install $pkg"
+		fi
+	done
+
+	#
+	# Packages not in pkgsrc
+	#
+	for pkg in dmake sgstools rpcgen astmsgtools; do
+		if ! pkg_info -qe $pkg; then
+			curl -k "$conf_pkgsrcurl/$pkg.tgz" -o \
+			    /var/tmp/$pkg.tgz || fatal \
+			    "failed to fetch $pkg.tgz"
+			$conf_priv pkg_add -C /dev/null /var/tmp/$pkg.tgz || fatal \
+			    "failed to pkg_add $pkg"
+			rm -f /var/tmp/$pkg.tgz
+		fi
+	done
+}
+
+function install_ips
+{
+	fatal "Building on ips based systems has yet to be implemented"
+}
+
+function install_packages
+{
+	if [[ -z "$conf_ips" ]]; then
+		install_pkgin
+	else
+		install_ips
+	fi
+	[[ $? -eq 0 ]] || fatal "failed to install packages"
+}
+
+function fetch_studio
+{
+	[[ -f "/opt/SUNWspro/prod/bin/cc" ]] && return
+	[[ -z "$SUNW_SPRO12_URL" ]] && fatal \
+	    "SUNW_SPRO12_URL not set in configure.*"
+	curl -k "$SUNW_SPRO12_URL" | bzcat | $conf_priv tar xf - -C /opt
+	[[ $? -eq 0 ]] || fatal "failed to fetch Studio"
+	[[ -e /opt/SUNspro/sunstudio12.1 ]] && return
+	$conf_priv ln -s /opt/SUNWspro /opt/SUNWspro/sunstudio12.1 || fatal \
+	    "cannot create Studio symlink"
+}
+
+function fetch_illumos
+{
+	local tfile="projects/illumos/usr/src/tools/env/illumos.sh"
+	[[ -f "$tfile" ]] && return
+	[[ -z "$GET_ILLUMOS" ]] && fatal "configure must define GET_ILLUMOS"
+	cd projects >/dev/null || fatal "failed to cd into projects directory"
+	/bin/bash -c "$GET_ILLUMOS " || fatal "fetching illumos failed"
+	cd - >/dev/null || fatal "failed to cd out of projects directory"
+	[[ -f "$tfile" ]] || fatal "fetched illumos appears to be missing files"
+}
+
+function fetch_illumos_extra
+{
+	local tfile="projects/illumos-extra/Makefile"
+	[[ -f "$tfile" ]] && return
+	[[ -z "$GET_ILLUMOS_EXTRA" ]] && fatal \
+	    "configure must define GET_ILLUMOS_EXTRA"
+	cd projects >/dev/null || fatal "failed to cd into projects directory"
+	/bin/bash -c  "$GET_ILLUMOS_EXTRA" || fatal \
+	    "fetching illumos-extra failed"
+	cd - >/dev/null || fatal "failed to cd out of projects directory"
+	[[ -f "$tfile" ]] || fatal \
+	    "fetched illumos-extra appears to be missing files"
+}
+
+function fetch_adjuncts
+{
+	local tgz
+	[[ -z "$ILLUMOS_ADJUNCT_TARBALL_URL" ]] && fatal \
+	    "ILLUMOS_ADJUNCT_TARBALL_URL missing from configure"
+	tgz=$(curl -k "$ILLUMOS_ADJUNCT_TARBALL_URL" | grep href | tail -n1 | \
+	    cut -d '"' -f2)
+	[[ -z "$tgz" ]] && fatal \
+	    "Unable to get adjuncts from ILLUMOS_ADJUNCT_TARBALL_URL"
+	curl -kO $ILLUMOS_ADJUNCT_TARBALL_URL/$tgz
+	[[ $? -eq 0 ]] || fatal "failed to fetch adjuncts tarball"
+}
+
+function setup_overlays
+{
+	local of="overlay/order"
+	[[ -z "$OVERLAYS" ]] && fatal \
+	    "OVERLAYS variable missing from configure.*"
+	rm -f $of
+	touch $of || fail "failed to create $of"
+	for o in $OVERLAYS; do
+		echo -n "$conf_root/overlay/$o " >> $of || fatal \
+		    "failed to append to $of"
+	done
+}
+
+function fetch_closed
+{
+	local ildir="projects/illumos"
+	local cld="on-closed-bin.i386.tar.bz2"
+	local clnd="on-closed-bin-nd.i386.tar.bz2"
+	[[ -z "$ON_CLOSED_BINS_URL" ]] && fatal \
+	    "missing ON_CLOSED_BINS_URL from configure"
+	[[ -z "$ON_CLOSED_BINS_ND_URL" ]] && fatal \
+	    "missing ON_CLOSED_BINS_ND_URL from configure"
+	if [[ ! -f $ildir/$cld ]]; then
+		curl -k $ON_CLOSED_BINS_URL -o $ildir/$cld || fatal \
+		"failed to fetch closed bins (debug)"
+	fi
+	if [[ ! -f $ildir/$clnd ]]; then
+		curl -k $ON_CLOSED_BINS_ND_URL -o $ildir/$clnd || fatal \
+		"failed to fetch closed bins (non-debug)"
+	fi
+	cd $ildir >/dev/null 2>&1 || fatal "failed to cd into $ildir"
+	tar xpjf $cld || fatal \
+	    "failed to extract closed bins (debug)"
+	tar xpjf $clnd || fatal \
+	    "failed to extract closed bins (non-debug)"
+	cd - >/dev/null 2>&1
+}
+
+function generate_env
+{
+	local nopts="-CimMNnt"
+	local lint debug lprefix
+
+	if [[ -n "$ILLUMOS_ENABLE_LINT" ]]; then
+		lint=1
+		debug=1
+	fi
+
+	if [[ "$ILLUMOS_ENABLE_DEBUG" == "exclusive" ]]; then
+		debug=2
+	elif [[ "$ILLUMOS_ENABLE_DEBUG" == "yes" ]]; then
+		debug=1
+	elif [[ "$ILLUMOS_ENABLE_DEBUG" == "no" ]]; then
+		debug=
+	elif [[ -n "$ILLUMOS_ENABLE_DEBUG" ]]; then
+		fatal "Unknown value for $ILLUMOS_ENABLE_DEBUG"
+	fi
+
+	[[ -n "$lint" ]] && nopts="${nopts}l"
+	[[ "$debug" -eq 1 ]] && nopts="${nopts}D"
+	[[ "$debug" -eq 2 ]] && nopts="${nopts}DF"
+
+	lprefix=$(echo $conf_root | tr / _)
+	[[ $? -eq 0 ]] || fatal "failed to create lock prefix"
+
+cat > "projects/illumos/illumos.sh" <<EOF
+NIGHTLY_OPTIONS="$nopts";			export NIGHTLY_OPTIONS
+GATE="${RELEASE_VER}";				export GATE
+CODEMGR_WS="$conf_root/projects/illumos";	export CODEMGR_WS
+MAX_JOBS=128
+maxjobs() {
+        ncpu=\`kstat -p cpu_info:::state | grep -c on-line\`
+        if [[ \$(( \$ncpu + 2 )) -lt \${MAX_JOBS} ]]; then
+                expr \$ncpu + 2
+        else
+                printf "%d\n" \${MAX_JOBS}
+        fi
+}
+DMAKE_MAX_JOBS=\`maxjobs\`;			export DMAKE_MAX_JOBS
+
+PARENT_WS="";					export PARENT_WS
+CLONE_WS="http://hg.illumos.org/illumos-gate"	export CLONE_WS
+STAFFER="nobody";				export STAFFER
+BUILD_PROJECT="";				export BUILD_PROJECT
+LOCKNAME="\`whoami\`_${lprefix}_nightly.lock";	export LOCKNAME
+ATLOG="\$CODEMGR_WS/log";			export ATLOG
+LOGFILE="\$ATLOG/nightly.log";			export LOGFILE
+MACH=\`uname -p\`;				export MACH
+ON_CLOSED_BINS="\$CODEMGR_WS/closed";		export ON_CLOSED_BINS
+REF_PROTO_LIST="\$PARENT_WS/usr/src/proto_list_\${MACH}";
+						export REF_PROTO_LIST
+ROOT="$conf_root/proto";			export ROOT
+ADJUNCT_PROTO="$conf_root/proto.strap";		export ADJUNCT_PROTO
+NATIVE_ADJUNCT="/opt/local";			export NATIVE_ADJUNCT
+SRC="\$CODEMGR_WS/usr/src";			export SRC
+VERSION="\$GATE";				export VERSION
+PARENT_ROOT="$conf_root/proto";			export PARENT_ROOT
+PARENT_TOOLS_ROOT="\$PARENT_WS/usr/src/tools/proto/root_\$MACH-nd"
+						export PARENT_TOOLS_ROOT
+PKGARCHIVE="\${CODEMGR_WS}/packages/\${MACH}/nightly";
+						export PKGARCHIVE
+PKGPUBLISHER_REDIST="${PUBLISHER}";		export PKGPUBLISHER_REDIST
+MAKEFLAGS=k;					export MAKEFLAGS
+UT_NO_USAGE_TRACKING="1";			export UT_NO_USAGE_TRACKING
+CW_NO_SHADOW="1";				export CW_NO_SHADOW
+MULTI_PROTO="no";				export MULTI_PROTO
+BUILD_TOOLS="\${CODEMGR_WS}/usr/src/tools/proto/root_\${MACH}-nd/opt";
+						export BUILD_TOOLS
+SPRO_ROOT=/opt/SUNWspro;			export SPRO_ROOT
+SPRO_VROOT=\$SPRO_ROOT;				export SPRO_VROOT
+GNU_ROOT="$conf_root/proto.strap/usr/gnu"		export GNU_ROOT
+GCC_ROOT="$conf_root/proto.strap/usr";		export GCC_ROOT
+# A temporary hack to allow bootstrap of cw(1)
+CW_GCC_DIR="\${GCC_ROOT}/bin";			export CW_GCC_DIR
+# Use GCC as the primary compiler
+__GNUC="";					export __GNUC
+# Use GCC4 specific flags
+__GNUC4="";					export __GNUC4
+JAVA_ROOT=/opt/local/java/openjdk7;		export JAVA_ROOT
+FLEX=/opt/local/bin/flex;			export FLEX
+GNUXGETTEXT=/opt/local/bin/xgettext;		export GNUXGETTEXT
+PYTHON=/opt/local/bin/python2.7;		export PYTHON
+ELFDUMP=/usr/bin/elfdump;			export ELFDUMP
+LORDER=/usr/bin/lorder;				export LORDER
+MCS=/usr/bin/mcs;				export MCS
+NM=/usr/bin/nm;					export NM
+STRIP=/usr/bin/strip;				export STRIP
+TSORT=/usr/bin/tsort;				export TSORT
+AR=/usr/bin/ar;					export AR
+MAKE="$conf_root/proto.strap/usr/bin/dmake";	export MAKE
+LEX=/opt/local/bin/lex;				export LEX
+YACC=/opt/local/bin/yacc;			export YACC
+RPCGEN=/opt/local/bin/rpcgen;			export RPCGEN
+ASTBINDIR=/opt/local/ast/bin;			export ASTBINDIR
+LD_TOXIC_PATH="\$ROOT/lib:\$ROOT/usr/lib";	export LD_TOXIC_PATH
+EOF
+	[[ $? -eq 0 ]] || fatal "failed to write illumos nightly env file"
+}
+
+function update_git
+{
+	local path=$1
+	local branch=$2
+	local cur
+
+	[[ -d "$path" ]] || fatal "can't find directory $path"
+	[[ -z "$branch" ]] && fatal "unspecified branch"
+
+	cd $path >/dev/null 2>&1 || fatal "can't cd into $path"
+	cur=$(git branch | grep "^*" | awk 'BEGIN{ FS=" " } { print $2 }')
+	[[ $? -ne 0 || -z "$cur" ]] && fatal "failed to get current branch"
+	[[ "$cur " == "$branch" ]] && return
+	git checkout $branch >/dev/null || fatal "failed to checkout $branch"
+	cd - >/dev/null 2>&1 || fatal "can't return to previous directory"
+}
+
+function update_branches
+{	
+	local line repo branch
+
+	[[ ! -f "configure-branches" ]] && return
+
+	while read line; do
+		line=$(echo $line | sed -e 's/#.*$//')
+		[[ $? -eq 0 ]] || fatal \
+		    "failed to remove comments in configure-branches"
+
+		[[ -z "$line" ]] && continue
+
+		repo=${line%%:*}
+		branch=${line##*:}
+
+		[[ -z "$repo" ]] && fatal \
+		    "missing repository entry in line: [$line]"
+		[[ -z "$branch" ]] && fatal \
+		    "missing branch entry in line: [$branch]"
+		
+		#
+		# Handle the legacy name of smartos-live
+		#
+		if [[ "$repo" == "smartos-live" || \
+		    "$repo" == "illumos-live" ]]; then
+			warn "configure-branches can't update smartos-live"
+			warn "ignoring and continuing on..."	
+			continue
+		fi
+		if [[ "$repo" == "illumos-joyent" || \
+		    "$repo" == "illumos" ]]; then
+			update_git "projects/illumos" $branch && continue
+		elif  [[ "$repo" == "smartos-overlay" ]]; then
+			update_git "overlay/smartos" $branch && continue
+		elif  [[ "$repo" == "illumos-extra" ]]; then
+			update_git "projects/illumos-extra" $branch && continue
+		else
+			[[ -d "projects/local/$repo" ]] && update_git \
+			    "projects/local/$repo" $branch && continue
+		fi
+		fatal "failed to update $repo to $branch"
+	done < "configure-branches"
+}
+
+echo "Doing pre-flight checks... \c "
+check_loc
+echo "done."
+echo "Creating projects directory ... \c "
+create_projects
+echo "done."
+echo "Sourcing configure.* files ... \c "
+source_vars
+echo "done."
+echo "Installing packages ... \c "
+install_packages
+echo "done."
+echo "Fetching studio... \c "
+fetch_studio
+echo "done."
+echo "Fetching illumos... \c "
+fetch_illumos
+echo "done."
+echo "Fetching illumos-extra... \c "
+fetch_illumos_extra
+echo "done."
+echo "Fetching adjuncts tgz... \c "
+fetch_adjuncts
+echo "done."
+echo "Configuring overlays... \c "
+setup_overlays
+echo "done."
+echo "Fetching and extracting closed bins ... \c "
+fetch_closed
+echo "done."
+echo "Generating illumos environment file... \c "
+generate_env
+echo "done."
+echo "Setting up branches... \c "
+update_branches
+echo "done."
+
+
+cat <<EOF
+Configuration complete. To build the live image run:
+gmake world && gmake live
+EOF
+
+# Congrats, we made it
+exit 0
